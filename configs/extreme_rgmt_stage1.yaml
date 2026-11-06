@@ -1,0 +1,54 @@
+# Extreme-RGMT Stage-I values transcribed from 2607.20110v1, Table III.
+# Dataset values transcribed from Table IV. FSQ levels are an explicit
+# reproduction assumption because the paper does not report per-scalar levels.
+experiment:
+  name: extreme_rgmt_stage1
+  seed: 1
+  num_envs: 4096
+  max_iterations: 10000
+  motion_fps: 50
+  control_dt: 0.02
+  sim_substep_dt: 0.005
+  sim_decimation: 4
+  adaptive_sampling: true
+  adaptive_sampling_stage: all_motion_bins
+  fsq_levels_per_scalar: [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+
+policy:
+  proprio_dim: 64
+  action_dim: 29
+  reference_token_dim: 38
+  history_length: 10
+  reference_window_length: 21
+  state_encoder_dims: [64, 128, 64]
+  action_encoder_dims: [29, 64, 64]
+  command_encoder_dims: [38, 128, 64]
+  command_latent_tokens: 2
+  command_latent_width: 32
+  actor_hidden_dims: [1024, 1024, 512, 256]
+  critic_hidden_dims: [1024, 1024, 512, 512]
+  attention_heads: 4  # paper does not specify; explicit implementation choice
+
+ppo:
+  rollout_steps_per_env: 24
+  learning_epochs: 5
+  minibatches: 4
+  learning_rate: 0.001
+  schedule: adaptive_kl
+  desired_kl: 0.01
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_parameter: 0.2
+  entropy_coefficient: 0.005
+  max_gradient_norm: 1.0
+
+stage2:
+  acquisition_environment_fraction: 0.8
+  mastered_clip_seconds: 10
+  mastered_success_threshold: 0.8
+  evaluation_rollouts_per_clip: 5
+  consolidation_lambda_base: 0.3
+  consolidation_kappa: 5.0
+  consolidation_reference_ratio: 0.6
+  consolidation_ema_beta: 0.99
+  star_top_fraction_per_bin: 0.05

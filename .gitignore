@@ -1,0 +1,8 @@
+/data/
+/logs/
+__pycache__/
+.pytest_cache/
+.venv-extreme-rgmt/
+
+third_party/PMT/
+third_party/
