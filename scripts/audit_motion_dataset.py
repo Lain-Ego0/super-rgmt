@@ -9,6 +9,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from scripts.convert_lafan1_to_pmt import ISAAC_JOINTS
+except ModuleNotFoundError:  # direct `python scripts/audit_motion_dataset.py` invocation
+    from convert_lafan1_to_pmt import ISAAC_JOINTS
+
 PAPER_MINUTES = {"LAFAN1": 146.651, "AMASS": 30.677, "in_house_Xsens": 8.446}
 REQUIRED = {
     "joint_pos": (29,),
@@ -33,6 +38,10 @@ def inspect_clip(path: Path) -> dict[str, object]:
         missing = sorted(set(REQUIRED) - set(clip.files))
         if missing or "fps" not in clip.files:
             raise ValueError(f"{path}: missing arrays {missing + ([] if 'fps' in clip.files else ['fps'])}")
+        if "quat_order" not in clip.files or str(np.asarray(clip["quat_order"]).item()) != "xyzw":
+            raise ValueError(f"{path}: body_quat_w must declare quat_order=xyzw")
+        if "joint_names" not in clip.files or clip["joint_names"].astype(str).tolist() != ISAAC_JOINTS:
+            raise ValueError(f"{path}: joint_names do not match the pinned Isaac G1 articulation order")
         fps = float(np.asarray(clip["fps"]).item())
         arrays: dict[str, list[int]] = {}
         frame_counts: set[int] = set()
@@ -55,6 +64,8 @@ def inspect_clip(path: Path) -> dict[str, object]:
         "sha256": sha256_file(path),
         "frames": frames,
         "fps": fps,
+        "quat_order": "xyzw",
+        "joint_names": ISAAC_JOINTS,
         "duration_seconds": (frames - 1) / fps,
         "arrays": arrays,
     }

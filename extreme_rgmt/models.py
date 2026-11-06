@@ -339,25 +339,37 @@ class ExtremeRGMTActorCritic(nn.Module):
 
     def compute_sonic_aux_losses(self, obs: Mapping[str, Tensor] | Any) -> dict[str, Any] | None:
         """Expose PACE action alignment through PMT PPO's auxiliary-loss hook."""
+        consolidation_obs = getattr(self, "_pace_consolidation_obs", None)
         role = obs.get(self.pace_role_key) if hasattr(obs, "get") else None
-        if role is None:
+        if consolidation_obs is not None:
+            # STAR's generator keeps mastered data out of every PPO loss and
+            # supplies it separately for the PACE action-MSE objective only.
+            current_mean = self.act_inference(consolidation_obs)
+            if self.pace_reference_policy is None:
+                raise RuntimeError("initialize_pace_reference() before PACE consolidation updates")
+            with torch.no_grad():
+                reference_mean = self.pace_reference_policy.act_inference(consolidation_obs)
+            loss = (current_mean - reference_mean).square().mean()
+        elif role is not None:
+            # Retain the mixed-batch path for direct objective use and diagnostics.
+            role = role.reshape(-1).to(dtype=torch.long)
+            consolidation = role == 1
+            if not torch.any(consolidation):
+                zero = self.action_mean.sum() * 0.0
+                return {
+                    "aux_losses": {self.pace_aux_loss_name: zero},
+                    "aux_loss_coef": {self.pace_aux_loss_name: self.pace_consolidation_weight},
+                }
+            if self.pace_reference_policy is None:
+                raise RuntimeError("initialize_pace_reference() before PACE consolidation updates")
+            current_mean = self.action_mean
+            if current_mean.shape[0] != role.numel():
+                raise ValueError("PACE role labels must align with the PPO minibatch")
+            with torch.no_grad():
+                reference_mean = self.pace_reference_policy.act_inference(obs)
+            loss = (current_mean[consolidation] - reference_mean[consolidation]).square().mean()
+        else:
             return None
-        role = role.reshape(-1).to(dtype=torch.long)
-        consolidation = role == 1
-        if not torch.any(consolidation):
-            zero = self.action_mean.sum() * 0.0
-            return {
-                "aux_losses": {self.pace_aux_loss_name: zero},
-                "aux_loss_coef": {self.pace_aux_loss_name: self.pace_consolidation_weight},
-            }
-        if self.pace_reference_policy is None:
-            raise RuntimeError("initialize_pace_reference() before PACE consolidation updates")
-        current_mean = self.action_mean
-        if current_mean.shape[0] != role.numel():
-            raise ValueError("PACE role labels must align with the PPO minibatch")
-        with torch.no_grad():
-            reference_mean = self.pace_reference_policy.act_inference(obs)
-        loss = (current_mean[consolidation] - reference_mean[consolidation]).square().mean()
         return {
             "aux_losses": {self.pace_aux_loss_name: loss},
             "aux_loss_coef": {self.pace_aux_loss_name: self.pace_consolidation_weight},

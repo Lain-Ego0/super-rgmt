@@ -198,15 +198,15 @@ def star_pace_update(
     resample_ratio: float = 0.25,
     num_mini_batches: int,
     num_epochs: int,
+    pace_policy=None,
 ):
     """Temporarily install paper-aligned PACE/STAR data handling on PPO storage.
 
-    Use as ``with star_pace_update(...): algorithm.update()``. It derives raw
-    advantages as returns minus values, normalizes high/remaining difficulty
-    groups independently, zeros consolidation advantages (so consolidation
-    samples do not contribute to PPO's actor surrogate), and replaces the
-    feed-forward minibatch generator with STAR's mixed sampler. All storage
-    state and the original generator are restored on context exit.
+    PPO minibatches contain acquisition transitions only, so the PPO surrogate,
+    critic loss, and entropy regularizer are all computed on the acquisition
+    distribution. A separate mastered-state minibatch is exposed to the policy's
+    auxiliary-loss hook for the PACE action-MSE term. All temporary state and the
+    original generator are restored on context exit.
     """
     required = {"bin_ids", "role_ids", "env_ids", "fragment_ids"}
     if not required.issubset(metadata):
@@ -226,23 +226,25 @@ def star_pace_update(
     if torch.any((roles != 0) & (roles != 1)):
         raise ValueError("role_ids must be 0 (acquisition) or 1 (consolidation)")
 
-    original_advantages = storage.advantages.clone()
     original_generator = storage.mini_batch_generator
     raw_advantages = (storage.returns - storage.values).reshape(-1)
-    normalized, _ = difficulty_conditioned_advantages(
-        raw_advantages, bins, bin_probabilities.to(storage.device)
-    )
-    normalized[roles == 1] = 0.0
-    pool, pool_probs = star_fragment_pool(
-        raw_advantages[roles == 0],
-        bins[roles == 0],
-        bin_probabilities.to(storage.device),
-        flat_meta["env_ids"][roles == 0],
-        flat_meta["fragment_ids"][roles == 0],
-        top_fraction,
-    )
     acquisition_flat_indices = torch.nonzero(roles == 0, as_tuple=False).flatten()
     consolidation_flat_indices = torch.nonzero(roles == 1, as_tuple=False).flatten()
+    acquisition_advantages = raw_advantages[acquisition_flat_indices]
+    acquisition_bins = bins[acquisition_flat_indices]
+    normalized_acquisition_advantages, _ = difficulty_conditioned_advantages(
+        acquisition_advantages,
+        acquisition_bins,
+        bin_probabilities.to(storage.device),
+    )
+    pool, pool_probs = star_fragment_pool(
+        acquisition_advantages,
+        acquisition_bins,
+        bin_probabilities.to(storage.device),
+        flat_meta["env_ids"][acquisition_flat_indices],
+        flat_meta["fragment_ids"][acquisition_flat_indices],
+        top_fraction,
+    )
     if acquisition_flat_indices.numel() == 0 or consolidation_flat_indices.numel() == 0:
         raise ValueError("PACE requires at least one sample from each environment role")
 
@@ -251,45 +253,60 @@ def star_pace_update(
             raise ValueError("STAR minibatch generation requires RL storage")
         if requested_batches != num_mini_batches or requested_epochs != num_epochs:
             raise ValueError("update minibatch settings differ from STAR context settings")
-        batch_size = self.num_envs * self.num_transitions_per_env
-        minibatch_size = batch_size // requested_batches
+        if requested_batches > acquisition_flat_indices.numel() or requested_batches > consolidation_flat_indices.numel():
+            raise ValueError("STAR needs at least one acquisition and consolidation transition per minibatch")
+
         obs = self.observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
         old_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
-        if minibatch_size < 2:
-            raise ValueError("PACE minibatches need room for both acquisition and consolidation samples")
-        con_fraction = consolidation_flat_indices.numel() / batch_size
-        con_per_batch = min(max(round(minibatch_size * con_fraction), 1), minibatch_size - 1)
-        acq_per_batch = minibatch_size - con_per_batch
+
         for _ in range(requested_epochs):
-            for _ in range(requested_batches):
-                acq_local = star_mixed_minibatch_indices(
-                    pool, pool_probs, acquisition_flat_indices.numel(), acq_per_batch, resample_ratio
+            shuffled_acquisition = acquisition_flat_indices[
+                torch.randperm(acquisition_flat_indices.numel(), device=self.device)
+            ]
+            shuffled_consolidation = consolidation_flat_indices[
+                torch.randperm(consolidation_flat_indices.numel(), device=self.device)
+            ]
+            acquisition_batches = torch.tensor_split(shuffled_acquisition, requested_batches)
+            consolidation_batches = torch.tensor_split(shuffled_consolidation, requested_batches)
+            for acquisition_regular_ids, consolidation_ids in zip(acquisition_batches, consolidation_batches):
+                acq_count = acquisition_regular_ids.numel()
+                if acq_count == 0 or consolidation_ids.numel() == 0:
+                    raise ValueError("PACE minibatches cannot have an empty role")
+                # STAR replaces a fraction of the acquisition minibatch with
+                # weighted draws from its selected high-value fragment pool.
+                local_ids = star_mixed_minibatch_indices(
+                    pool,
+                    pool_probs,
+                    acquisition_flat_indices.numel(),
+                    acq_count,
+                    resample_ratio,
                 )
-                acq_ids = acquisition_flat_indices[acq_local]
-                con_order = torch.randperm(
-                    consolidation_flat_indices.numel(), device=self.device
-                )[:con_per_batch]
-                con_ids = consolidation_flat_indices[con_order]
-                ids = torch.cat((acq_ids, con_ids))
-                ids = ids[torch.randperm(ids.numel(), device=self.device)]
-                yield (
-                    obs[ids], actions[ids], values[ids], advantages[ids], returns[ids],
-                    old_log_prob[ids], old_mu[ids], old_sigma[ids], (None, None), None,
-                )
+                acquisition_ids = acquisition_flat_indices[local_ids]
+                if pace_policy is not None:
+                    pace_policy._pace_consolidation_obs = obs[consolidation_ids]
+                try:
+                    yield (
+                        obs[acquisition_ids], actions[acquisition_ids], values[acquisition_ids],
+                        normalized_acquisition_advantages[local_ids].unsqueeze(-1),
+                        returns[acquisition_ids], old_log_prob[acquisition_ids],
+                        old_mu[acquisition_ids], old_sigma[acquisition_ids], (None, None), None,
+                    )
+                finally:
+                    if pace_policy is not None:
+                        pace_policy._pace_consolidation_obs = None
 
     try:
-        storage.advantages.copy_(normalized.reshape_as(storage.advantages))
         storage.mini_batch_generator = MethodType(_star_generator, storage)
         yield {"star_pool_size": int(pool.numel()), "acquisition_samples": int((roles == 0).sum())}
     finally:
-        storage.advantages.copy_(original_advantages)
         storage.mini_batch_generator = original_generator
+        if pace_policy is not None:
+            pace_policy._pace_consolidation_obs = None
 
 
 def pace_objective(acquisition_loss: Tensor, current_actions: Tensor, reference_actions: Tensor, weight: float) -> Tensor:
@@ -331,6 +348,73 @@ def pace_role_objective(
     else:
         consolidation_loss = current_action_means.sum() * 0.0
     return acquisition_ppo_loss + consolidation_weight * consolidation_loss, consolidation_loss
+
+
+@contextmanager
+def pace_reference_constraint(
+    algorithm,
+    reference_policy,
+    consolidation_weight: float,
+    *,
+    role_key: str = "extreme_rgmt_role",
+):
+    """Add the frozen Stage-I action-MSE term to PPO's actor surrogate.
+
+    The rollout storage already carries ``role_key`` in its observation
+    TensorDict. Acquisition advantages are supplied by :func:`star_pace_update`;
+    this context adds Eq. (15) on consolidation rows after the current policy
+    has evaluated each PPO minibatch. Both monkey-patched methods are restored
+    even if an update raises.
+    """
+    if consolidation_weight < 0.0:
+        raise ValueError("consolidation_weight must be nonnegative")
+    policy = algorithm.policy
+    if policy.is_recurrent:
+        raise ValueError("PACE reference constraint currently requires a feed-forward policy")
+    reference_policy.eval()
+    for parameter in reference_policy.parameters():
+        parameter.requires_grad_(False)
+
+    original_act = policy.act
+    original_compute = algorithm._compute_surrogate_loss
+    state: dict[str, Tensor] = {}
+
+    def act_with_reference(obs_batch, *args, **kwargs):
+        result = original_act(obs_batch, *args, **kwargs)
+        roles = obs_batch.get(role_key)
+        if roles is None:
+            raise KeyError(f"PPO minibatch is missing PACE role metadata {role_key!r}")
+        roles = roles.reshape(-1).to(dtype=torch.long)
+        current = policy.action_mean[: roles.numel()]
+        with torch.no_grad():
+            reference = reference_policy.act_inference(obs_batch)
+        if reference.shape != current.shape:
+            raise ValueError(
+                f"reference action shape {tuple(reference.shape)} does not match "
+                f"current policy shape {tuple(current.shape)}"
+            )
+        _, state["loss"] = pace_role_objective(
+            current.sum() * 0.0,
+            roles,
+            current,
+            reference,
+            1.0,
+        )
+        return result
+
+    def compute_with_reference(*args, **kwargs):
+        result = original_compute(*args, **kwargs)
+        if "loss" not in state:
+            raise RuntimeError("PACE loss was not prepared by the policy minibatch evaluation")
+        return (result[0] + consolidation_weight * state["loss"], *result[1:])
+
+    policy.act = act_with_reference
+    algorithm._compute_surrogate_loss = compute_with_reference
+    try:
+        yield state
+    finally:
+        policy.act = original_act
+        algorithm._compute_surrogate_loss = original_compute
 
 
 def difficulty_conditioned_advantages(

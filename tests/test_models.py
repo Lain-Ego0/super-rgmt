@@ -105,3 +105,25 @@ def test_pace_reference_auxiliary_loss_is_frozen_and_mastered_only():
 def test_pace_auxiliary_loss_is_optional_for_stage_one_observations():
     model = _model()
     assert model.compute_sonic_aux_losses(_observations()) is None
+
+
+def test_pace_auxiliary_uses_separate_mastered_batch_with_acquisition_only_ppo_batch():
+    model = _model()
+    model.initialize_pace_reference()
+    acquisition_obs = _observations(batch_size=2)
+    acquisition_obs["extreme_rgmt_role"] = torch.zeros(2, 1, dtype=torch.long)
+    mastered_obs = _observations(batch_size=3)
+    mastered_obs["extreme_rgmt_role"] = torch.ones(3, 1, dtype=torch.long)
+
+    with torch.no_grad():
+        model.action_mean_head.bias.add_(0.2)
+    model.act(acquisition_obs)
+    model._pace_consolidation_obs = mastered_obs
+    result = model.compute_sonic_aux_losses(acquisition_obs)
+    loss = result["aux_losses"]["pace_consolidation"]
+    assert loss.item() > 0.0
+    loss.backward()
+    assert model.action_mean_head.bias.grad is not None
+    assert torch.isfinite(model.action_mean_head.bias.grad).all()
+    assert all(parameter.grad is None for parameter in model.pace_reference_policy.parameters())
+    model._pace_consolidation_obs = None

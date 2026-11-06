@@ -3,6 +3,7 @@
 
 CSV source layout is [root_xyz, root_quat_xyzw, 29 SDK-order joint angles] at 30 Hz.
 Body poses are recomputed with the matching G1 MuJoCo model; output is resampled to 50 Hz.
+Joint arrays are permuted into the pinned Isaac G1 articulation order before saving.
 """
 from __future__ import annotations
 
@@ -22,6 +23,33 @@ JOINTS = [
     "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 ]
+# Runtime order emitted by the pinned Isaac Lab importer for the pinned G1 URDF.
+# PMT writes these arrays directly to the articulation, so this order is mandatory.
+ISAAC_JOINTS = [
+    "left_hip_pitch_joint", "right_hip_pitch_joint", "waist_yaw_joint",
+    "left_hip_roll_joint", "right_hip_roll_joint", "waist_roll_joint",
+    "left_hip_yaw_joint", "right_hip_yaw_joint", "waist_pitch_joint",
+    "left_knee_joint", "right_knee_joint", "left_shoulder_pitch_joint",
+    "right_shoulder_pitch_joint", "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+    "left_shoulder_roll_joint", "right_shoulder_roll_joint", "left_ankle_roll_joint",
+    "right_ankle_roll_joint", "left_shoulder_yaw_joint", "right_shoulder_yaw_joint",
+    "left_elbow_joint", "right_elbow_joint", "left_wrist_roll_joint",
+    "right_wrist_roll_joint", "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+    "left_wrist_yaw_joint", "right_wrist_yaw_joint",
+]
+
+
+def wxyz_to_xyzw(quaternions: np.ndarray) -> np.ndarray:
+    """Convert MuJoCo scalar-first quaternions to Isaac Lab scalar-last."""
+    return np.asarray(quaternions)[..., [1, 2, 3, 0]]
+
+
+def reorder_joint_channels(values: np.ndarray, source_names=JOINTS, target_names=ISAAC_JOINTS) -> np.ndarray:
+    if len(source_names) != len(target_names) or set(source_names) != set(target_names):
+        raise ValueError("source and target joint names must describe the same unique joints")
+    return values[:, [source_names.index(name) for name in target_names]]
+
+
 BODIES = [
     "pelvis", "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link", "right_hip_roll_link",
     "right_knee_link", "right_ankle_roll_link", "torso_link", "left_shoulder_roll_link", "left_elbow_link",
@@ -58,8 +86,8 @@ def convert(csv_path: Path, out_path: Path, model: mujoco.MjModel, src_fps: floa
     alpha = (t - i0).clip(0, 1)
     root_pos = raw[i0, :3] * (1 - alpha[:, None]) + raw[i0 + 1, :3] * alpha[:, None]
     root_quat = slerp_xyzw(raw[i0, 3:7], raw[i0 + 1, 3:7], alpha)
-    joint_pos = raw[i0, 7:36] * (1 - alpha[:, None]) + raw[i0 + 1, 7:36] * alpha[:, None]
-    joint_vel = gradient(joint_pos, 1 / fps)
+    source_joint_pos = raw[i0, 7:36] * (1 - alpha[:, None]) + raw[i0 + 1, 7:36] * alpha[:, None]
+    source_joint_vel = gradient(source_joint_pos, 1 / fps)
 
     joint_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in JOINTS]
     if min(joint_ids) < 0:
@@ -70,22 +98,24 @@ def convert(csv_path: Path, out_path: Path, model: mujoco.MjModel, src_fps: floa
     qpos_addresses = [int(model.jnt_qposadr[j]) for j in joint_ids]
     data = mujoco.MjData(model)
     body_pos = np.empty((n, len(BODIES), 3), np.float32)
-    body_quat = np.empty((n, len(BODIES), 4), np.float32)  # MuJoCo/Isaac wxyz
+    body_quat_mj = np.empty((n, len(BODIES), 4), np.float32)  # MuJoCo wxyz
     for k in range(n):
         data.qpos[:3] = root_pos[k]
         x, y, z, w = root_quat[k]
         data.qpos[3:7] = (w, x, y, z)
-        data.qpos[qpos_addresses] = joint_pos[k]
+        data.qpos[qpos_addresses] = source_joint_pos[k]
         mujoco.mj_forward(model, data)
         body_pos[k] = data.xpos[body_ids]
-        body_quat[k] = data.xquat[body_ids]
+        body_quat_mj[k] = data.xquat[body_ids]
+    joint_pos = reorder_joint_channels(source_joint_pos).astype(np.float32)
+    joint_vel = reorder_joint_channels(source_joint_vel).astype(np.float32)
     body_lin_vel = gradient(body_pos, 1 / fps)
     body_ang_vel = np.zeros_like(body_pos)
     dt = 1 / fps
     for k in range(1, n):
         for b in range(len(BODIES)):
-            q0 = body_quat[k - 1, b]
-            q1 = body_quat[k, b]
+            q0 = body_quat_mj[k - 1, b]
+            q1 = body_quat_mj[k, b]
             if np.dot(q0, q1) < 0:
                 q1 = -q1
             dq = np.empty(4, np.float64)
@@ -97,11 +127,13 @@ def convert(csv_path: Path, out_path: Path, model: mujoco.MjModel, src_fps: floa
             if norm > 1e-10:
                 body_ang_vel[k, b] = dq[1:] / norm * angle / dt
     body_ang_vel[0] = body_ang_vel[1]
+    body_quat = wxyz_to_xyzw(body_quat_mj)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, fps=np.float32(fps), joint_pos=joint_pos.astype(np.float32),
                         joint_vel=joint_vel, body_pos_w=body_pos, body_quat_w=body_quat,
                         body_lin_vel_w=body_lin_vel, body_ang_vel_w=body_ang_vel,
-                        body_names=np.asarray(BODIES))
+                        body_names=np.asarray(BODIES), joint_names=np.asarray(ISAAC_JOINTS),
+                        quat_order=np.asarray("xyzw"))
 
 
 def main() -> None:
